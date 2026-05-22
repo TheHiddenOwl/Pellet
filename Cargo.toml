@@ -1,0 +1,26 @@
+[package]
+name = "pellet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio          = { version = "1", features = ["full"] }
+tokio-rustls   = "0.26"
+russh          = "0.44"
+russh-keys     = "0.44"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+chrono         = { version = "0.4", features = ["serde"] }
+uuid           = { version = "1", features = ["v4"] }
+clap           = { version = "4", features = ["derive"] }
+toml           = "0.8"
+httparse       = "1.9"
+base64         = "0.22"
+rcgen          = "0.13"
+anyhow         = "1.0"
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+rand           = "0.8"
+async-trait    = "0.1"
+rustls-pemfile = "2.1"

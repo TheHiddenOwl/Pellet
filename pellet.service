@@ -1,0 +1,17 @@
+[Unit]
+Description=Pellet SSH/HTTP Honeypot
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/pellet --config /etc/pellet/pellet.toml
+Restart=always
+User=pellet
+Group=pellet
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
