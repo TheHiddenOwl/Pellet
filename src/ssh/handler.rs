@@ -40,10 +40,7 @@ impl russh::server::Server for Server {
         let ip = addr.map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
         let port = addr.map(|a| a.port()).unwrap_or(0);
 
-        let sid_clone = session_id.clone();
-        tokio::spawn(async move {
-            logger.log("ssh", ip, port, sid_clone, "connection_open", serde_json::json!({})).await;
-        });
+        logger.log("ssh", ip, port, session_id.clone(), "connection_open", serde_json::json!({}));
 
         Handler {
             logger: self.logger.clone(),
@@ -86,7 +83,7 @@ impl russh::server::Handler for Handler {
         logger.log("ssh", ip, port, session_id, "auth_attempt", serde_json::json!({
             "username": user,
             "password": pass,
-        })).await;
+        }));
 
         Ok(Auth::Reject { proceed_with_methods: None })
     }
@@ -110,7 +107,7 @@ impl russh::server::Handler for Handler {
         logger.log("ssh", ip, port, session_id, "auth_attempt", serde_json::json!({
             "username": user,
             "pubkey_fingerprint": fingerprint,
-        })).await;
+        }));
 
         Ok(Auth::Reject { proceed_with_methods: None })
     }
@@ -124,10 +121,10 @@ impl russh::server::Handler for Handler {
         let command_str = String::from_utf8_lossy(command).to_string();
         self.logger.log("ssh", self.ip.clone(), self.port, self.session_id.clone(), "exec_command", serde_json::json!({
             "command": command_str,
-        })).await;
+        }));
 
-        let _ = session.exit_status_request(channel, 127);
-        let _ = session.close(channel);
+        session.exit_status_request(channel, 127);
+        session.close(channel);
         Ok(())
     }
 
@@ -136,28 +133,22 @@ impl russh::server::Handler for Handler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.logger.log("ssh", self.ip.clone(), self.port, self.session_id.clone(), "exec_command", serde_json::json!({
+        self.logger.log("ssh", self.ip.clone(), self.port, self.session_id.clone(), "shell_request", serde_json::json!({
             "command": "shell",
-        })).await;
+        }));
 
-        let _ = session.exit_status_request(channel, 127);
-        let _ = session.close(channel);
+        session.exit_status_request(channel, 127);
+        session.close(channel);
         Ok(())
     }
 }
 
 impl Drop for Handler {
     fn drop(&mut self) {
-        let logger = self.logger.clone();
-        let ip = self.ip.clone();
-        let port = self.port;
-        let session_id = self.session_id.clone();
         let duration = self.start.elapsed().as_millis();
 
-        tokio::spawn(async move {
-            logger.log("ssh", ip, port, session_id, "connection_close", serde_json::json!({
-                "duration_ms": duration
-            })).await;
-        });
+        self.logger.log("ssh", self.ip.clone(), self.port, self.session_id.clone(), "connection_close", serde_json::json!({
+            "duration_ms": duration
+        }));
     }
 }
