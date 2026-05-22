@@ -4,6 +4,7 @@ use base64::{engine::general_purpose, Engine as _};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
 use tokio::net::{TcpListener};
 use uuid::Uuid;
 use tokio_rustls::TlsAcceptor;
@@ -57,28 +58,39 @@ trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncStream for T {}
 
 async fn handle_connection(
-    mut stream: Box<dyn AsyncStream>,
+    stream: Box<dyn AsyncStream>,
     addr: std::net::SocketAddr,
     logger: Arc<Logger>,
     config: Arc<HttpConfig>,
     is_tls: bool,
     sni: Option<String>,
 ) {
+    let _ = tokio::time::timeout(Duration::from_secs(30), handle_connection_inner(stream, addr, logger, config, is_tls, sni)).await;
+}
+
+async fn handle_connection_inner(
+    mut stream: Box<dyn AsyncStream>,
+    addr: std::net::SocketAddr,
+    logger: Arc<Logger>,
+    config: Arc<HttpConfig>,
+    is_tls: bool,
+    sni: Option<String>,
+) -> anyhow::Result<()> {
     let start = Instant::now();
     let session_id = Uuid::new_v4().to_string();
     let proto = if is_tls { "https" } else { "http" };
 
     logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "connection_open", serde_json::json!({
         "sni": sni
-    })).await;
+    }));
 
     let mut buffer = [0u8; 8192];
     let mut pos = 0;
 
-    loop {
-        match stream.read(&mut buffer[pos..]).await {
-            Ok(0) => break,
-            Ok(n) => {
+    let (amt, method, path, headers_map, user_agent) = loop {
+        match stream.read(&mut buffer[pos..]).await? {
+            0 => return Ok(()),
+            n => {
                 pos += n;
                 if let Some(_) = find_subsequence(&buffer[..pos], b"\r\n\r\n") {
                     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -97,75 +109,131 @@ async fn handle_connection(
                                 }
                                 headers_map.insert(name, value);
                             }
-
-                            let mut body = Vec::new();
-                            let content_length = headers_map.get("content-length")
-                                .and_then(|v| v.parse::<usize>().ok())
-                                .unwrap_or(0);
-
-                            let body_limit = std::cmp::min(content_length, MAX_BODY_SIZE);
-
-                            let body_start = amt;
-                            let already_read = pos - body_start;
-                            if already_read > 0 {
-                                body.extend_from_slice(&buffer[body_start..std::cmp::min(pos, body_start + body_limit)]);
-                            }
-
-                            if body.len() < body_limit {
-                                let mut remaining_body = vec![0u8; body_limit - body.len()];
-                                if let Ok(_) = stream.read_exact(&mut remaining_body).await {
-                                    body.extend_from_slice(&remaining_body);
-                                }
-                            }
-
-                            let scanner_tags = identify_scanners(&user_agent);
-
-                            logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "http_request", serde_json::json!({
-                                "method": method,
-                                "path": path,
-                                "headers": headers_map,
-                                "body_b64": general_purpose::STANDARD.encode(&body),
-                                "scanner_tags": scanner_tags,
-                                "body_truncated": content_length > MAX_BODY_SIZE
-                            })).await;
-
-                            let response_body = config.response_body.as_deref().unwrap_or(DEFAULT_IIS_PAGE);
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\n\
-                                Server: {}\r\n\
-                                Content-Type: text/html\r\n\
-                                Content-Length: {}\r\n\
-                                Connection: close\r\n\
-                                \r\n\
-                                {}",
-                                config.banner,
-                                response_body.len(),
-                                response_body
-                            );
-
-                            let _ = stream.write_all(response.as_bytes()).await;
-                            break;
+                            break (amt, method, path, headers_map, user_agent);
                         }
                         Ok(httparse::Status::Partial) => {
                             if pos >= buffer.len() {
-                                break;
+                                logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "oversized_header", serde_json::json!({}));
+                                return Ok(());
                             }
                             continue;
                         }
-                        Err(_) => break,
+                        Err(_) => return Ok(()),
                     }
                 }
                 if pos >= buffer.len() {
-                    break;
+                    logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "oversized_header", serde_json::json!({}));
+                    return Ok(());
                 }
             }
-            Err(_) => break,
+        }
+    };
+
+    let mut body = Vec::new();
+    let body_start = amt;
+    let already_read = &buffer[body_start..pos];
+
+    let content_length = headers_map.get("content-length")
+        .and_then(|v| v.parse::<usize>().ok());
+
+    let is_chunked = headers_map.get("transfer-encoding")
+        .map(|v| v.to_lowercase().contains("chunked"))
+        .unwrap_or(false);
+
+    if is_chunked {
+        // Simple manual chunked decoding with DoS protection
+        let mut current_buffer = already_read.to_vec();
+        loop {
+            // Limit buffer size to prevent memory exhaustion from slow-send or large non-delimited data
+            if current_buffer.len() > MAX_BODY_SIZE + 1024 {
+                return Err(anyhow::anyhow!("Chunked stream buffer exceeded limit"));
+            }
+
+            // Find end of chunk size line
+            if let Some(pos) = find_subsequence(&current_buffer, b"\r\n") {
+                let size_str = String::from_utf8_lossy(&current_buffer[..pos]);
+                let chunk_size = usize::from_str_radix(size_str.trim(), 16).map_err(|_| anyhow::anyhow!("Invalid chunk size"))?;
+
+                if chunk_size > MAX_BODY_SIZE {
+                    return Err(anyhow::anyhow!("Chunk size too large"));
+                }
+
+                if chunk_size == 0 { break; }
+
+                let chunk_start = pos + 2;
+                let needed = chunk_start + chunk_size + 2;
+
+                while current_buffer.len() < needed {
+                    let mut temp = [0u8; 4096];
+                    let n = stream.read(&mut temp).await?;
+                    if n == 0 { break; }
+                    current_buffer.extend_from_slice(&temp[..n]);
+                    if current_buffer.len() > MAX_BODY_SIZE + 1024 {
+                        return Err(anyhow::anyhow!("Chunked stream buffer exceeded limit during read"));
+                    }
+                }
+
+                if current_buffer.len() >= needed {
+                    let body_part = &current_buffer[chunk_start..chunk_start + chunk_size];
+                    if body.len() + body_part.len() <= MAX_BODY_SIZE {
+                        body.extend_from_slice(body_part);
+                    }
+                    current_buffer = current_buffer[needed..].to_vec();
+                } else {
+                    break;
+                }
+            } else {
+                let mut temp = [0u8; 4096];
+                let n = stream.read(&mut temp).await?;
+                if n == 0 { break; }
+                current_buffer.extend_from_slice(&temp[..n]);
+            }
+            if body.len() >= MAX_BODY_SIZE { break; }
+        }
+    } else if let Some(cl) = content_length {
+        let body_limit = std::cmp::min(cl, MAX_BODY_SIZE);
+        if already_read.len() > 0 {
+            body.extend_from_slice(&already_read[..std::cmp::min(already_read.len(), body_limit)]);
+        }
+        if body.len() < body_limit {
+            let mut remaining_body = vec![0u8; body_limit - body.len()];
+            let _ = stream.read_exact(&mut remaining_body).await;
+            body.extend_from_slice(&remaining_body);
         }
     }
 
+    let scanner_tags = identify_scanners(&user_agent);
+
+    logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "http_request", serde_json::json!({
+        "method": method,
+        "path": path,
+        "headers": headers_map,
+        "body_b64": general_purpose::STANDARD.encode(&body),
+        "scanner_tags": scanner_tags,
+        "body_truncated": body.len() >= MAX_BODY_SIZE && content_length.map(|cl| cl > MAX_BODY_SIZE).unwrap_or(true)
+    }));
+
+    let response_body = config.response_body.as_deref().unwrap_or(DEFAULT_IIS_PAGE);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+        Server: {}\r\n\
+        Content-Type: text/html\r\n\
+        Content-Length: {}\r\n\
+        Connection: close\r\n\
+        \r\n\
+        {}",
+        config.banner,
+        response_body.len(),
+        response_body
+    );
+
+    let _ = stream.write_all(response.as_bytes()).await;
+
     logger.log(proto, addr.ip().to_string(), addr.port(), session_id.clone(), "connection_close", serde_json::json!({
         "duration_ms": start.elapsed().as_millis()
-    })).await;
+    }));
+
+    Ok(())
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -175,10 +243,11 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn identify_scanners(ua: &str) -> Vec<&'static str> {
     let mut tags = Vec::new();
     let scanners = [
-        "masscan", "zgrab", "Nuclei", "Shodan", "censys", "curl/", "python-requests"
+        "masscan", "zgrab", "nuclei", "shodan", "censys", "curl/", "python-requests"
     ];
+    let ua_lower = ua.to_lowercase();
     for s in scanners {
-        if ua.contains(s) {
+        if ua_lower.contains(s) {
             tags.push(s);
         }
     }

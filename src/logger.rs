@@ -3,8 +3,7 @@ use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Serialize)]
 pub struct LogEvent {
@@ -19,26 +18,35 @@ pub struct LogEvent {
 }
 
 pub struct Logger {
-    file: Arc<Mutex<std::fs::File>>,
+    tx: mpsc::UnboundedSender<LogEvent>,
     sensor_id: String,
 }
 
 impl Logger {
-    pub fn new(path: &Path, sensor_id: String) -> anyhow::Result<Self> {
+    pub fn new(path: &Path, sensor_id: String) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        Ok(Self {
-            file: Arc::new(Mutex::new(file)),
-            sensor_id,
-        })
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<LogEvent>();
+
+        let handle = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let Ok(line) = serde_json::to_string(&event) {
+                    let _ = writeln!(file, "{}", line);
+                }
+            }
+            let _ = file.flush();
+        });
+
+        Ok((Self { tx, sensor_id }, handle))
     }
 
-    pub async fn log(&self, proto: &str, src_ip: String, src_port: u16, session_id: String, event: &str, payload: serde_json::Value) {
+    pub fn log(&self, proto: &str, src_ip: String, src_port: u16, session_id: String, event: &str, payload: serde_json::Value) {
         let log_event = LogEvent {
             ts: Utc::now(),
             session_id,
@@ -50,12 +58,7 @@ impl Logger {
             payload,
         };
 
-        if let Ok(line) = serde_json::to_string(&log_event) {
-            let file = self.file.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut f = file.blocking_lock();
-                let _ = writeln!(f, "{}", line);
-            }).await;
-        }
+        let _ = self.tx.send(log_event);
     }
+
 }

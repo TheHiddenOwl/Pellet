@@ -32,18 +32,21 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", args.config.display(), e))?;
     let config: config::Config = toml::from_str(&config_content)?;
 
-    let logger = Arc::new(logger::Logger::new(&config.general.log_file, config.general.sensor_id.clone())?);
+    config.validate()?;
+
+    let (logger, logger_handle) = logger::Logger::new(&config.general.log_file, config.general.sensor_id.clone())?;
+    let logger = Arc::new(logger);
 
     let mut tasks = Vec::new();
 
     if config.http.enabled {
         let tls_acceptor = if let (Some(cert_path), Some(key_path)) = (&config.http.tls_cert, &config.http.tls_key) {
-            Some(setup_tls(cert_path, key_path)?)
+            Some(setup_tls(cert_path, key_path, &config.http.tls_cn, &config.http.tls_san)?)
         } else if config.http.tls_bind.is_some() {
             // Generate self-signed if bind is set but certs are missing
             let cert_path = Path::new("cert.pem");
             let key_path = Path::new("key.pem");
-            Some(setup_tls(cert_path, key_path)?)
+            Some(setup_tls(cert_path, key_path, &config.http.tls_cn, &config.http.tls_san)?)
         } else {
             None
         };
@@ -70,10 +73,31 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Pellet honeypot started");
 
-    for task in tasks {
-        let _ = task.await;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("SIGINT received, shutting down...");
+        }
+        _ = async {
+            #[cfg(unix)]
+            sigterm.recv().await;
+            #[cfg(not(unix))]
+            std::future::pending::<()>().await;
+        } => {
+            tracing::info!("SIGTERM received, shutting down...");
+        }
     }
 
+    for task in tasks {
+        task.abort();
+    }
+
+    drop(logger);
+    let _ = logger_handle.await;
+
+    tracing::info!("Pellet honeypot stopped");
     Ok(())
 }
 
@@ -84,13 +108,13 @@ sensor_id  = "dev-1"
 
 [http]
 enabled    = true
-bind       = "0.0.0.0:8080"
-tls_bind   = "0.0.0.0:8443"
+bind       = "0.0.0.0:80"
+tls_bind   = "0.0.0.0:443"
 banner     = "Apache/2.4.57 (Ubuntu)"
 
 [ssh]
 enabled    = true
-bind       = "0.0.0.0:2222"
+bind       = "0.0.0.0:22"
 banner     = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6"
 host_key   = "ssh_host_ed25519_key"
 "#;
@@ -98,13 +122,26 @@ host_key   = "ssh_host_ed25519_key"
     Ok(())
 }
 
-fn setup_tls(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+fn setup_tls(cert_path: &Path, key_path: &Path, cn: &Option<String>, san: &Option<Vec<String>>) -> anyhow::Result<TlsAcceptor> {
     if !cert_path.exists() || !key_path.exists() {
         tracing::info!("Generating self-signed TLS certificate...");
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, "Pellet Honeypot");
-        params.subject_alt_names = vec![rcgen::SanType::DnsName(rcgen::Ia5String::try_from("localhost")?)];
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn.as_deref().unwrap_or("Pellet Honeypot"));
+
+        if let Some(san_list) = san {
+            params.subject_alt_names = san_list.iter()
+                .map(|s| {
+                    if s.parse::<std::net::IpAddr>().is_ok() {
+                        rcgen::SanType::IpAddress(s.parse().unwrap())
+                    } else {
+                        rcgen::SanType::DnsName(rcgen::Ia5String::try_from(s.as_str()).unwrap())
+                    }
+                })
+                .collect();
+        } else {
+            params.subject_alt_names = vec![rcgen::SanType::DnsName(rcgen::Ia5String::try_from("localhost")?)];
+        }
 
         let key_pair = rcgen::KeyPair::generate()?;
         let cert = params.self_signed(&key_pair)?;
@@ -139,29 +176,16 @@ fn setup_ssh_key(key_path: &Path) -> anyhow::Result<SshKeyPair> {
         tracing::info!("Generating SSH host key...");
         let key = SshKeyPair::generate_ed25519().ok_or_else(|| anyhow::anyhow!("Failed to generate SSH key"))?;
 
-        // Use standard ed25519_dalek to export to PKCS8 as russh-keys is tricky
-        // Actually, we can just use the internal representation if we really have to
-        // or find what russh_keys expects.
-        // Let's try to just write a fake key for now to see if it works with load_secret_key
-        // No, that's bad.
-
-        // Let's use the `ssh-key` crate which russh depends on.
-        // wait, I can just use `key.to_openssh()` if I can find it.
-        // It's not there.
-
-        // Okay, I will use a hardcoded key for the first run if generation fails,
-        // but that's not good for a honeypot.
-
-        // Let's try one more time to find a way to write the key.
-        // russh_keys::key::KeyPair is an enum.
-
+        // In russh-keys 0.44, persisting Ed25519 is straightforward via ed25519_dalek.
+        // For other types (RSA/ECDSA), russh-keys 0.44 doesn't provide a public API
+        // to easily export them to OpenSSH/PKCS8 format without extra dependencies.
+        // We stick to Ed25519 for now as it's the modern standard and correctly persists.
         if let SshKeyPair::Ed25519(ref kp) = key {
-             // kp is ed25519_dalek::SigningKey
-             use ed25519_dalek::pkcs8::EncodePrivateKey;
-             let pkcs8 = kp.to_pkcs8_pem(Default::default())?;
-             fs::write(key_path, pkcs8.as_bytes())?;
-             return Ok(key);
+            use ed25519_dalek::pkcs8::EncodePrivateKey;
+            let pkcs8 = kp.to_pkcs8_pem(Default::default())?;
+            fs::write(key_path, pkcs8.as_bytes())?;
         }
+        return Ok(key);
     }
 
     russh_keys::load_secret_key(key_path, None).map_err(|e| anyhow::anyhow!("Failed to load SSH key: {}", e))
