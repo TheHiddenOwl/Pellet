@@ -1,0 +1,17 @@
+
+[general]
+log_file   = "tests/test_run/test_events.jsonl"
+sensor_id  = "integration-test"
+
+[http]
+enabled    = true
+bind       = "127.0.0.1:8081"
+tls_bind   = "127.0.0.1:8444"
+tls_cn     = "Integration Test"
+banner     = "Test-IIS"
+
+[ssh]
+enabled    = true
+bind       = "127.0.0.1:2223"
+banner     = "SSH-2.0-Test"
+host_key   = "tests/test_run/ssh_host_ed25519_key"
