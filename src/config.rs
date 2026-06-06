@@ -54,3 +54,49 @@ pub struct SshConfig {
     pub banner: String,
     pub host_key: PathBuf,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_sensor_id() {
+        assert!(validate_sensor_id("prod-1").is_ok());
+        assert!(validate_sensor_id("sensor_123").is_ok());
+        assert!(validate_sensor_id("").is_err());
+        assert!(validate_sensor_id("a".repeat(65).as_str()).is_err());
+        assert!(validate_sensor_id("invalid id!").is_err());
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let config = Config {
+            general: GeneralConfig {
+                log_file: PathBuf::from("events.jsonl"),
+                sensor_id: "test-sensor".to_string(),
+            },
+            http: HttpConfig {
+                enabled: true,
+                bind: "0.0.0.0:80".to_string(),
+                tls_bind: None,
+                tls_cert: None,
+                tls_key: None,
+                tls_cn: None,
+                tls_san: None,
+                banner: "IIS".to_string(),
+                response_body: None,
+            },
+            ssh: SshConfig {
+                enabled: true,
+                bind: "0.0.0.0:22".to_string(),
+                banner: "SSH".to_string(),
+                host_key: PathBuf::from("key"),
+            },
+        };
+        assert!(config.validate().is_ok());
+
+        let mut invalid_config = config.clone();
+        invalid_config.general.sensor_id = "".to_string();
+        assert!(invalid_config.validate().is_err());
+    }
+}
